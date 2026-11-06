@@ -492,13 +492,19 @@ impl<'a> AcceptCall<'a> {
                 return Err(error);
             }
         };
+        if !is_group {
+            send_callee_relay_latency(self.client, &handle.call_id, self.incoming, call_creator)
+                .await;
+        }
         if let Some(accept) = deferred_accept {
             wait_for_peer_ready(self.client, &handle.call_id).await;
-            if registration.ensure_current().is_ok()
-                && let Err(error) = self.client.send_node(accept).await
-            {
-                let _ = handle.terminate().await;
-                return Err(error.into());
+            if registration.ensure_current().is_ok() {
+                if let Err(error) = self.client.send_node(accept).await {
+                    let _ = handle.terminate().await;
+                    return Err(error.into());
+                }
+                send_callee_transport(self.client, &handle.call_id, self.incoming, call_creator)
+                    .await;
             }
         }
         if !is_group && let Some(own_lid) = self.client.lid() {
@@ -1591,6 +1597,78 @@ async fn send_answer_signaling_with_ids(
     )?;
     send_answer_node(client, registration, teardown, preaccept).await?;
     send_answer_node(client, registration, teardown, accept).await
+}
+
+/// Send a callee-side call signal with a fresh `<call id>`; the server ignores id-less ones (#1098).
+async fn send_callee_call_signal(
+    client: &Client,
+    mut node: wacore_binary::Node,
+    what: &'static str,
+    call_id: &str,
+) {
+    node.attrs.insert("id", client.generate_request_id());
+    match client.send_node(node).await {
+        Ok(()) => log::debug!("voip: sent callee {what} for {call_id}"),
+        Err(error) => warn!("voip: failed to send callee {what} for {call_id}: {error}"),
+    }
+}
+
+/// The callee's half of the relay election, mirroring the caller fix of #1098 (#1794): announce the
+/// relay our media transport dials. A companion that sent none got only STUN from the relay and the
+/// caller heard nothing once it had accepted (6 November).
+async fn send_callee_relay_latency(
+    client: &Client,
+    call_id: &str,
+    incoming: &IncomingCall,
+    call_creator: &Jid,
+) {
+    let Some(relay) = incoming.media().and_then(|media| media.relay.as_ref()) else {
+        return;
+    };
+    let Some(endpoint) = wacore::voip_control::relay_parse::get_media_relay_endpoint(relay) else {
+        return;
+    };
+    let Some(address) = endpoint.ipv4_te2_bytes else {
+        warn!(
+            "voip: callee relaylatency for {call_id} skipped: {} has no te2",
+            endpoint.relay_name
+        );
+        return;
+    };
+    let node =
+        wacore::stanza::call::build_relay_latency(&wacore::stanza::call::RelayLatencyParams {
+            call_id,
+            to: &incoming.from,
+            call_creator,
+            latency_ms: endpoint.c2r_rtt_ms.unwrap_or(40),
+            relay_name: &endpoint.relay_name,
+            address_bytes: &address,
+            devices: &[],
+        });
+    log::debug!(
+        "voip: callee relaylatency for {call_id}: relay {}",
+        endpoint.relay_name
+    );
+    send_callee_call_signal(client, node, "relaylatency", call_id).await;
+}
+
+/// After the accept, the callee's `<transport>` (round 1 over the relay), as the phone sends it as a
+/// caller right after an `<accept>` and #1794 sends it for ours.
+async fn send_callee_transport(
+    client: &Client,
+    call_id: &str,
+    incoming: &IncomingCall,
+    call_creator: &Jid,
+) {
+    let node = wacore::stanza::call::build_transport(&wacore::stanza::call::TransportParams {
+        call_id,
+        to: &incoming.from,
+        call_creator,
+        p2p_cand_round: Some("1"),
+        transport_message_type: Some("1"),
+        relay_te: None,
+    });
+    send_callee_call_signal(client, node, "transport", call_id).await;
 }
 
 /// How long a direct incoming call's `<accept>` waits for the caller's first `<mute_v2>` before it is
