@@ -497,7 +497,8 @@ impl<'a> AcceptCall<'a> {
                 .await;
         }
         if let Some(accept) = deferred_accept {
-            wait_for_peer_ready(self.client, &handle.call_id).await;
+            let caller_ready =
+                wait_for_peer_ready(self.client, &handle.call_id, PEER_READY_TIMEOUT).await;
             if registration.ensure_current().is_ok() {
                 if let Err(error) = self.client.send_node(accept).await {
                     let _ = handle.terminate().await;
@@ -505,6 +506,13 @@ impl<'a> AcceptCall<'a> {
                 }
                 send_callee_transport(self.client, &handle.call_id, self.incoming, call_creator)
                     .await;
+                spawn_own_sibling_dismiss(
+                    self.client,
+                    &handle.call_id,
+                    handle.generation,
+                    call_creator,
+                    caller_ready,
+                );
             }
         }
         if !is_group && let Some(own_lid) = self.client.lid() {
@@ -1675,8 +1683,8 @@ async fn send_callee_transport(
 /// sent anyway (on the 6 November trace it came about 2 s after the preaccept, as the relay connected).
 const PEER_READY_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Wait until the caller of `call_id` sent its first `<mute_v2>`, or `PEER_READY_TIMEOUT`.
-async fn wait_for_peer_ready(client: &Client, call_id: &str) {
+/// Wait until the caller of `call_id` sent its first `<mute_v2>`, or `timeout`; true when it did.
+async fn wait_for_peer_ready(client: &Client, call_id: &str, timeout: Duration) -> bool {
     let registry = client.call_registry();
     let ready = async {
         loop {
@@ -1687,13 +1695,118 @@ async fn wait_for_peer_ready(client: &Client, call_id: &str) {
             listener.await;
         }
     };
-    match wacore::runtime::timeout(&*client.runtime, PEER_READY_TIMEOUT, ready).await {
-        Ok(()) => log::debug!("voip: caller ready for {call_id}; sending the deferred accept"),
-        Err(_) => log::debug!(
-            "voip: no caller mute_v2 for {call_id} in {PEER_READY_TIMEOUT:?}; accepting"
-        ),
-    }
+    let seen = match wacore::runtime::timeout(&*client.runtime, timeout, ready).await {
+        Ok(()) => {
+            log::debug!("voip: caller ready for {call_id}");
+            true
+        }
+        Err(_) => {
+            log::debug!("voip: no caller mute_v2 for {call_id} in {timeout:?}");
+            false
+        }
+    };
     registry.forget_peer_mute(call_id);
+    seen
+}
+
+/// How long after an accept sent without the caller's `<mute_v2>` the own-device dismiss still
+/// waits for it. A caller that never sends one never took our accept (the silent calls of
+/// 6 November); the account's phone must then keep ringing so somebody can still answer it.
+const LATE_PEER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// When the own-device dismiss goes out once the caller took our accept: at once, then twice more
+/// while the call lasts, so a phone that was asleep and reconnects late still gets one.
+const OWN_DISMISS_DELAYS: [Duration; 3] =
+    [Duration::ZERO, Duration::from_secs(3), Duration::from_secs(8)];
+
+/// The account's other devices to dismiss: every device the registry knows for our own user, the
+/// primary (device 0) always among them, never this device.
+fn own_dismiss_targets(own: &Jid, registry: Option<Vec<Jid>>) -> Vec<Jid> {
+    let mut primary = own.clone();
+    primary.device = 0;
+    primary.agent = 0;
+    primary.integrator = 0;
+    let mut targets: Vec<Jid> = Vec::new();
+    for device in registry.unwrap_or_default().into_iter().chain([primary]) {
+        let same_user = device.user == own.user && device.server == own.server;
+        let is_self = same_user && device.device == own.device;
+        let seen = targets.iter().any(|t| {
+            t.user == device.user && t.server == device.server && t.device == device.device
+        });
+        if same_user && !is_self && !seen {
+            targets.push(device);
+        }
+    }
+    targets
+}
+
+/// Callee-side dismiss of the account's own other devices once the caller took our accept.
+///
+/// WA Web and the APK leave this to the caller (`dismiss_outgoing_siblings`), yet the account's
+/// locked phone rang through a whole answered call while the official iPhone caller had our accept,
+/// its receipt and two-way audio (6 November, 21:13). One `<terminate reason="accepted_elsewhere">`
+/// per own device, in the caller's per-device form, repeated on `OWN_DISMISS_DELAYS` while the call
+/// is still this generation. Nothing goes out unless the caller sent its `<mute_v2>`.
+fn spawn_own_sibling_dismiss(
+    client: &Client,
+    call_id: &str,
+    generation: u64,
+    call_creator: &Jid,
+    caller_ready: bool,
+) {
+    let Some(client) = client.self_weak.get().and_then(|w| w.upgrade()) else {
+        return;
+    };
+    let Some(own) = client.lid() else {
+        return;
+    };
+    let call_id = call_id.to_owned();
+    let call_creator = call_creator.clone();
+    let runtime = client.runtime.clone();
+    runtime.spawn_detached(Box::pin(async move {
+        if !caller_ready
+            && !wait_for_peer_ready(&client, &call_id, LATE_PEER_READY_TIMEOUT).await
+        {
+            log::debug!(
+                "voip: caller never took the accept for {call_id}; own devices keep ringing"
+            );
+            return;
+        }
+        let mut primary = own.clone();
+        primary.device = 0;
+        primary.agent = 0;
+        primary.integrator = 0;
+        let registry = client.get_devices_from_registry(&primary).await;
+        let targets = own_dismiss_targets(&own, registry);
+        for delay in OWN_DISMISS_DELAYS {
+            if !delay.is_zero() {
+                client.runtime.sleep(delay).await;
+            }
+            if client.call_registry().generation_of(&call_id) != Some(generation) {
+                return;
+            }
+            for device in &targets {
+                let id = client.generate_request_id();
+                let node = build_terminate(&TerminateParams {
+                    call_id: &call_id,
+                    to: device,
+                    id: Some(&id),
+                    call_creator: &call_creator,
+                    reason: Some(wacore::stanza::call::TERMINATE_REASON_ACCEPTED_ELSEWHERE),
+                });
+                match client.send_node(node).await {
+                    Ok(()) => log::debug!(
+                        "voip: dismissed own device {} (accepted_elsewhere) for {call_id}",
+                        device.observe()
+                    ),
+                    Err(error) => warn!(
+                        "voip: failed to dismiss own device {} for {call_id}: {error}",
+                        device.observe()
+                    ),
+                }
+            }
+        }
+    }));
 }
 
 async fn send_answer_node(
@@ -5170,6 +5283,34 @@ mod tests {
     use crate::store::persistence_manager::PersistenceManager;
     use crate::store::traits::Backend;
     use crate::test_utils::{MockHttpClient, create_test_backend, seed_peer_session};
+
+    fn lid_device(user: &str, device: u16) -> Jid {
+        let mut jid = Jid::new(user, Server::Lid);
+        jid.device = device;
+        jid
+    }
+
+    // The own-device dismiss reaches every other device of our own user, the primary phone even
+    // when the registry has no record, and never this device or another user.
+    #[test]
+    fn own_dismiss_targets_cover_the_primary_and_skip_this_device() {
+        let own = lid_device("134000000000054", 6);
+        let without_record = own_dismiss_targets(&own, None);
+        assert_eq!(without_record, vec![lid_device("134000000000054", 0)]);
+        let with_record = own_dismiss_targets(
+            &own,
+            Some(vec![
+                lid_device("134000000000054", 0),
+                lid_device("134000000000054", 6),
+                lid_device("134000000000054", 9),
+                lid_device("140000000000078", 0),
+            ]),
+        );
+        assert_eq!(
+            with_record,
+            vec![lid_device("134000000000054", 0), lid_device("134000000000054", 9)]
+        );
+    }
 
     async fn make_client() -> Arc<Client> {
         let client = crate::test_utils::create_test_client().await;
