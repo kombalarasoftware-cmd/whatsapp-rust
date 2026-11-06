@@ -95,6 +95,15 @@ impl StanzaHandler for CallHandler {
                 #[cfg(feature = "voip-control")]
                 let mut call = call;
                 #[cfg(feature = "voip-control")]
+                if let CallAction::RelayLatency {
+                    call_id,
+                    call_creator,
+                } = &call.action
+                {
+                    echo_callee_relay_latency(&client, &nr, &call.from, call_id, call_creator)
+                        .await;
+                }
+                #[cfg(feature = "voip-control")]
                 if matches!(
                     &call.action,
                     CallAction::GroupUpdate { update } if update.rekey_requested
@@ -1063,6 +1072,15 @@ impl StanzaHandler for CallHandler {
                 }
             }
             Ok(None) => {
+                // The caller's first <mute_v2> arrives once it is ready for this device's answer;
+                // a deferred direct <accept> waits for it (AcceptCall::start).
+                #[cfg(feature = "voip-control")]
+                if let Some(call_id) = nr
+                    .get_optional_child("mute_v2")
+                    .and_then(|mute| mute.attrs().optional_string("call-id"))
+                {
+                    client.call_registry().note_peer_mute(&call_id);
+                }
                 if let Some(ack) = typed_control_ack
                     && let Err(error) = send_node_boxed(&client, ack).await
                 {
@@ -1524,6 +1542,63 @@ fn reject_is_device_busy(action: &CallAction) -> bool {
             if reason.as_deref() == Some(REJECT_REASON_BUSY)
                 || reason.as_deref() == Some(REJECT_REASON_ENC)
     )
+}
+
+/// The callee's half of the relay election: answer each `<te>` of an incoming call's `<relaylatency>`
+/// with the same relay and latency, as WA Web and meowcaller do. The library sent no callee
+/// `<relaylatency>` at all; a companion's `<accept>` then went unacked while the account's other
+/// devices kept ringing (6 November). Each echo carries a `<call id>`: the server ignores id-less
+/// call signals (#1098).
+#[cfg(feature = "voip-control")]
+async fn echo_callee_relay_latency(
+    client: &Arc<Client>,
+    nr: &wacore_binary::NodeRef<'_>,
+    from: &Jid,
+    call_id: &str,
+    call_creator: &Jid,
+) {
+    let registry = client.call_registry();
+    let incoming = registry.is_ringing(call_id)
+        || registry.snapshot(call_id).is_some_and(|session| {
+            session.direction == wacore::voip_control::CallDirection::Incoming
+        });
+    let Some(action) = nr.get_optional_child("relaylatency") else {
+        return;
+    };
+    if !incoming {
+        return;
+    }
+    for te in action.get_children_by_tag("te") {
+        let mut attrs = te.attrs();
+        let Some(latency) = attrs
+            .optional_string("latency")
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let relay_name = attrs
+            .optional_string("relay_name")
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let Some(address) = te.content_bytes() else {
+            continue;
+        };
+        let mut node =
+            wacore::stanza::call::build_relay_latency(&wacore::stanza::call::RelayLatencyParams {
+                call_id,
+                to: from,
+                call_creator,
+                latency_ms: latency.wrapping_sub(0x0200_0000),
+                relay_name: &relay_name,
+                address_bytes: address,
+                devices: &[],
+            });
+        node.attrs.insert("id", client.generate_request_id());
+        match client.send_node(node).await {
+            Ok(()) => debug!("call: echoed relaylatency {relay_name} for {call_id}"),
+            Err(error) => warn!("call: failed to echo relaylatency for {call_id}: {error}"),
+        }
+    }
 }
 
 #[cfg(feature = "voip-control")]

@@ -458,11 +458,18 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         registration.ensure_current()?;
-        // Final acceptance waits until media setup succeeded and the registered generation is still
-        // current; only then may the caller apply the participant keys and enter the call.
-        if let Some(accept) = accept {
-            send_answer_node(self.client, &registration, &mut teardown, accept).await?;
-        }
+        // A direct call's <accept> waits until media is up and the caller sent its first <mute_v2>,
+        // as WA Web and meowcaller answer. Sent right after <preaccept>, before the caller was ready,
+        // it was never acked and the callee's other devices kept ringing (6 November). Group answers
+        // keep their order: acceptance once the registered generation is still current.
+        let deferred_accept = if is_group {
+            if let Some(accept) = accept {
+                send_answer_node(self.client, &registration, &mut teardown, accept).await?;
+            }
+            None
+        } else {
+            accept
+        };
         let result = open_registered_media(
             self.client,
             &registration,
@@ -485,6 +492,15 @@ impl<'a> AcceptCall<'a> {
                 return Err(error);
             }
         };
+        if let Some(accept) = deferred_accept {
+            wait_for_peer_ready(self.client, &handle.call_id).await;
+            if registration.ensure_current().is_ok()
+                && let Err(error) = self.client.send_node(accept).await
+            {
+                let _ = handle.terminate().await;
+                return Err(error.into());
+            }
+        }
         if !is_group && let Some(own_lid) = self.client.lid() {
             self.client.call_registry().set_group_invite_self_device(
                 &handle.call_id,
@@ -1563,6 +1579,31 @@ async fn send_answer_signaling_with_ids(
     )?;
     send_answer_node(client, registration, teardown, preaccept).await?;
     send_answer_node(client, registration, teardown, accept).await
+}
+
+/// How long a direct incoming call's `<accept>` waits for the caller's first `<mute_v2>` before it is
+/// sent anyway (on the 6 November trace it came about 2 s after the preaccept, as the relay connected).
+const PEER_READY_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Wait until the caller of `call_id` sent its first `<mute_v2>`, or `PEER_READY_TIMEOUT`.
+async fn wait_for_peer_ready(client: &Client, call_id: &str) {
+    let registry = client.call_registry();
+    let ready = async {
+        loop {
+            let listener = registry.listen_peer_mute();
+            if registry.peer_mute_seen(call_id) {
+                return;
+            }
+            listener.await;
+        }
+    };
+    match wacore::runtime::timeout(&*client.runtime, PEER_READY_TIMEOUT, ready).await {
+        Ok(()) => log::debug!("voip: caller ready for {call_id}; sending the deferred accept"),
+        Err(_) => log::debug!(
+            "voip: no caller mute_v2 for {call_id} in {PEER_READY_TIMEOUT:?}; accepting"
+        ),
+    }
+    registry.forget_peer_mute(call_id);
 }
 
 async fn send_answer_node(

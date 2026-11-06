@@ -611,7 +611,14 @@ pub struct CallRegistry {
     /// for an offer still ringing) from a `<terminate>` for an answered or outgoing call. Active-call
     /// absence cannot tell them apart, since an answered call leaves the map on teardown too.
     ringing: Mutex<HashSet<String>>,
+    /// Incoming 1:1 calls whose caller already sent its first `<mute_v2>`, oldest first and bounded. The
+    /// callee's deferred `<accept>` waits for it (see `AcceptCall::start`).
+    peer_mute: Mutex<VecDeque<String>>,
+    peer_mute_event: Arc<event_listener::Event>,
 }
+
+/// How many `<mute_v2>` call ids the registry keeps for deferred accepts.
+const PEER_MUTE_KEPT: usize = 64;
 
 impl Default for CallRegistry {
     fn default() -> Self {
@@ -622,6 +629,8 @@ impl Default for CallRegistry {
             pending_initial_group_controls: Mutex::new(VecDeque::new()),
             registration_event: Arc::new(event_listener::Event::new()),
             ringing: Mutex::new(HashSet::new()),
+            peer_mute: Mutex::new(VecDeque::new()),
+            peer_mute_event: Arc::new(event_listener::Event::new()),
         }
     }
 }
@@ -3149,6 +3158,45 @@ impl CallRegistry {
         self.ringing_calls().insert(call_id.to_string());
     }
 
+    /// Record that the caller of `call_id` sent a `<mute_v2>` and wake any deferred accept.
+    pub fn note_peer_mute(&self, call_id: &str) {
+        {
+            let mut seen = self
+                .peer_mute
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !seen.iter().any(|id| id == call_id) {
+                if seen.len() >= PEER_MUTE_KEPT {
+                    seen.pop_front();
+                }
+                seen.push_back(call_id.to_owned());
+            }
+        }
+        self.peer_mute_event.notify(usize::MAX);
+    }
+
+    /// Whether the caller of `call_id` has sent a `<mute_v2>`.
+    pub fn peer_mute_seen(&self, call_id: &str) -> bool {
+        self.peer_mute
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|id| id == call_id)
+    }
+
+    /// Listen for the next `<mute_v2>`, then recheck the desired call id.
+    pub fn listen_peer_mute(&self) -> event_listener::EventListener {
+        self.peer_mute_event.listen()
+    }
+
+    /// Drop the `<mute_v2>` marker of `call_id` once its accept went out.
+    pub fn forget_peer_mute(&self, call_id: &str) {
+        self.peer_mute
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|id| id != call_id);
+    }
+
     /// Whether a pending incoming-offer marker still exists for `call_id`.
     pub fn is_ringing(&self, call_id: &str) -> bool {
         self.ringing_calls().contains(call_id)
@@ -3241,6 +3289,23 @@ impl CallRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn peer_mute_markers_are_per_call_bounded_and_forgotten() {
+        let reg = CallRegistry::default();
+        assert!(!reg.peer_mute_seen("CALL-A"));
+        reg.note_peer_mute("CALL-A");
+        reg.note_peer_mute("CALL-A");
+        assert!(reg.peer_mute_seen("CALL-A"));
+        assert!(!reg.peer_mute_seen("CALL-B"));
+        reg.forget_peer_mute("CALL-A");
+        assert!(!reg.peer_mute_seen("CALL-A"));
+        for n in 0..=PEER_MUTE_KEPT {
+            reg.note_peer_mute(&format!("CALL-{n}"));
+        }
+        assert!(!reg.peer_mute_seen("CALL-0"));
+        assert!(reg.peer_mute_seen(&format!("CALL-{PEER_MUTE_KEPT}")));
+    }
+
     use super::*;
     use crate::types::group_call::{
         CallLinkMedia, GroupCallDevice, GroupCallEncRekey, GroupCallParticipant, GroupCallRelay,
