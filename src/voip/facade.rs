@@ -1497,6 +1497,9 @@ fn answer_preaccept_capability(video: bool, audio: AudioFormat) -> &'static [u8]
     }
 }
 
+/// The experiment bucket list WA Web puts in a direct audio `<accept>` (meowcaller's capture).
+const WA_WEB_ACCEPT_BUCKET_IDS: &str = "125208,94276";
+
 fn build_answer_signaling(
     incoming: &IncomingCall,
     audio: AudioFormat,
@@ -1530,8 +1533,14 @@ fn build_answer_signaling(
         answer_preaccept_capability(video, audio),
         video,
     );
-    // Captured video accepts mirror the offer's peer experiment metadata; audio accepts omit it.
+    // Captured video accepts mirror the offer's peer experiment metadata.
     let metadata = if video { incoming.media() } else { None };
+    // A direct audio answer goes in the WA Web shape: one rate, net, encopt and the metadata, no
+    // capability and no voip_settings. With those two the official iPhone app never acked the
+    // companion's <accept> and the account's phone kept ringing (6 November); meowcaller notes
+    // "capability+both-rates fails" and answers this way. The codec then follows the offer and the
+    // preaccept capability, so a caller announcing MLOW gets MLOW framing.
+    let wa_web_audio = !video && !is_group;
     let accept = build_accept(&AcceptParams {
         call_id,
         to: &target,
@@ -1540,11 +1549,11 @@ fn build_answer_signaling(
         audio_rates: &audio_rates,
         relay_te: None,
         rte: None,
-        voip_settings: standard_opus
+        voip_settings: (standard_opus && !wa_web_audio)
             .then(|| standard_opus_voip_settings(audio.rtp_clock_rate == 48_000)),
         // A captured from-start video accept carries no capability child; audio answers advertise
         // the selected MLOW/standard-Opus capability.
-        capability: if video {
+        capability: if video || wa_web_audio {
             None
         } else if standard_opus {
             Some(&CAPABILITY_STANDARD_OPUS_OFFER)
@@ -1553,8 +1562,11 @@ fn build_answer_signaling(
         },
         video,
         peer_abtest_bucket: metadata.and_then(|offer| offer.peer_abtest_bucket.as_deref()),
-        peer_abtest_bucket_id_list: metadata
-            .and_then(|offer| offer.peer_abtest_bucket_id_list.as_deref()),
+        peer_abtest_bucket_id_list: if wa_web_audio {
+            Some(WA_WEB_ACCEPT_BUCKET_IDS)
+        } else {
+            metadata.and_then(|offer| offer.peer_abtest_bucket_id_list.as_deref())
+        },
     });
     Ok((preaccept, accept))
 }
@@ -6454,11 +6466,22 @@ mod tests {
         );
         let accept_action = &accept_ref.children().expect("accept action")[0];
         assert_eq!(accept_action.tag.as_ref(), "accept");
+        // WA Web shape: audio, net, encopt, metadata; no capability or voip_settings.
+        let tags: Vec<&str> = accept_action
+            .children()
+            .expect("accept children")
+            .iter()
+            .map(|child| child.tag.as_ref())
+            .collect();
+        assert_eq!(tags, ["audio", "net", "encopt", "metadata"]);
         assert_eq!(
             accept_action
-                .get_optional_child("capability")
-                .and_then(|capability| capability.content_bytes()),
-            Some(CAPABILITY_OFFER.as_slice())
+                .get_optional_child("metadata")
+                .and_then(|metadata| metadata
+                    .attrs()
+                    .optional_string("peer_abtest_bucket_id_list"))
+                .as_deref(),
+            Some(WA_WEB_ACCEPT_BUCKET_IDS)
         );
     }
 
